@@ -23,7 +23,7 @@ API_URL = os.getenv("EXAM_API_URL", "https://exam.sanand.workers.dev/questionDat
 TZ = ZoneInfo("Asia/Kolkata")
 USD_PER_UNIT = {"USD": 1.0, "EUR": 1.12, "INR": 0.01101}
 
-app = FastAPI(title="Acme Appliances Order Ledger Agent", version="1.0.0")
+app = FastAPI(title="Acme Appliances Order Ledger Agent", version="1.1.0")
 session = requests.Session()
 orders: list[dict[str, Any]] = []
 rates = dict(USD_PER_UNIT)
@@ -205,7 +205,22 @@ def answer_question(question: str) -> Any:
     count = len(rows)
 
     asks_average = any(k in ql for k in ("average", "avg", "on average", "mean"))
-    asks_count = any(k in ql for k in ("how many orders", "number of orders", "count of orders", "order count", "how many customers", "number of customers", "how many products", "count"))
+    # Explicit distinct-customer wording must win over the generic customer
+    # ranking detector below (which otherwise returns a customer ID).
+    asks_distinct_customers = bool(re.search(
+        r"\b(?:how many|number of|count of)?\s*(?:distinct|unique|different) customers\b",
+        ql,
+    )) or bool(re.search(
+        r"\bhow many customers\b.*\b(?:bought|buy|purchased|placed|paid)\b",
+        ql,
+    ))
+    asks_count = (
+        asks_distinct_customers
+        or any(k in ql for k in (
+            "how many orders", "number of orders", "count of orders", "order count",
+            "how many customers", "number of customers", "how many products", "count",
+        ))
+    )
     asks_refunds = any(k in ql for k in ("refund", "refunded"))
     asks_revenue = any(k in ql for k in ("revenue", "sales", "total value", "total amount", "worth", "order value", "amount"))
     asks_product = any(k in ql for k in ("which product", "top product", "best-selling", "bestselling", "most sold", "most popular", "product sold", "by product"))
@@ -215,6 +230,20 @@ def answer_question(question: str) -> Any:
         rows = [r for r in rows if str(r.get("status", "")).lower() == "refunded"]
         vals = [amount_usd(r) for r in rows]
         total, count = sum(vals), len(vals)
+
+    # Handle distinct-customer counts explicitly before any ranking logic.
+    # The status/product/region/date filters have already been applied to rows,
+    # so "paid orders only" counts only customers with current paid orders.
+    if asks_distinct_customers:
+        return len({str(r.get("customer", "")).strip() for r in rows if str(r.get("customer", "")).strip()})
+
+    # Generic count questions also precede customer/product ranking questions.
+    if asks_count:
+        if "customers" in ql:
+            return len({str(r.get("customer", "")).strip() for r in rows if str(r.get("customer", "")).strip()})
+        if "products" in ql:
+            return len({str(r.get("product", "")).strip() for r in rows if str(r.get("product", "")).strip()})
+        return count
 
     if asks_product:
         agg: dict[str, float] = {}
@@ -237,13 +266,6 @@ def answer_question(question: str) -> Any:
         if not agg:
             return "No matching orders were found."
         return max(agg, key=agg.get)
-
-    if asks_count:
-        if "customers" in ql:
-            return len({str(r.get("customer", "")) for r in rows})
-        if "products" in ql:
-            return len({str(r.get("product", "")) for r in rows})
-        return count
 
     if asks_average:
         if not rows:
